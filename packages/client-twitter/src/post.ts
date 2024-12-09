@@ -64,9 +64,172 @@ function truncateToCompleteSentence(text: string): string {
     return text.slice(0, MAX_TWEET_LENGTH - 3).trim() + "...";
 }
 
+// Format duration in milliseconds to human readable string
+function formatDuration(ms: number): string {
+    if (ms < 1000) return `${ms}ms`;
+    
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    
+    const parts: string[] = [];
+    
+    if (hours > 0) {
+        parts.push(`${hours}h`);
+    }
+    if (minutes % 60 > 0) {
+        parts.push(`${minutes % 60}m`);
+    }
+    if (seconds % 60 > 0 || parts.length === 0) {
+        parts.push(`${seconds % 60}s`);
+    }
+    
+    return parts.join(' ');
+}
+
+// Performance and monitoring types
+interface StageMetrics {
+    startTime: number;
+    endTime?: number;
+    duration?: number;
+    success: boolean;
+    error?: string;
+    attempts: number;
+    retryCount: number;
+}
+
+interface TweetGenerationMetrics {
+    stages: {
+        initialization?: StageMetrics;
+        textGeneration?: StageMetrics;
+        imageGeneration?: StageMetrics;
+        posting?: StageMetrics;
+    };
+    totalDuration?: number;
+    overallSuccess: boolean;
+    scheduledTime?: number;
+    actualPostTime?: number;
+    delay?: number;
+}
+
+interface TweetGenerationStatus {
+    isGenerating: boolean;
+    startTime?: number;
+    currentStage?: 'initialization' | 'text' | 'image' | 'posting';
+    attempts: number;
+    lastError?: string;
+    metrics: TweetGenerationMetrics;
+    retryCount: number;
+    lastSuccessfulPost?: number;
+    consecutiveFailures: number;
+}
+
 export class TwitterPostClient {
     client: ClientBase;
     runtime: IAgentRuntime;
+
+    private tweetGenerationStatus: TweetGenerationStatus = {
+        isGenerating: false,
+        attempts: 0,
+        metrics: {
+            stages: {},
+            overallSuccess: false
+        },
+        retryCount: 0,
+        consecutiveFailures: 0
+    };
+
+    private readonly MAX_RETRY_ATTEMPTS = 3;
+    private readonly RETRY_DELAY_MS = 30000; // 30 seconds
+
+    private startStageMetrics(stage: keyof TweetGenerationMetrics['stages']) {
+        this.tweetGenerationStatus.metrics.stages[stage] = {
+            startTime: Date.now(),
+            success: false,
+            attempts: 1,
+            retryCount: 0
+        };
+        this.logPerformanceMetrics(`Starting ${stage}`);
+    }
+
+    private endStageMetrics(stage: keyof TweetGenerationMetrics['stages'], success: boolean, error?: Error) {
+        const stageMetrics = this.tweetGenerationStatus.metrics.stages[stage];
+        if (stageMetrics) {
+            stageMetrics.endTime = Date.now();
+            stageMetrics.duration = stageMetrics.endTime - stageMetrics.startTime;
+            stageMetrics.success = success;
+            if (error) {
+                stageMetrics.error = error.message;
+            }
+            this.logPerformanceMetrics(`Completed ${stage}`, success, error);
+        }
+    }
+
+    private logPerformanceMetrics(action: string, success?: boolean, error?: Error) {
+        const metrics = this.tweetGenerationStatus.metrics;
+        const currentStage = this.tweetGenerationStatus.currentStage;
+        const stageMetrics = currentStage ? metrics.stages[currentStage] : undefined;
+
+        const logData = {
+            action,
+            timestamp: new Date().toISOString(),
+            currentStage,
+            totalElapsedTime: this.tweetGenerationStatus.startTime 
+                ? Math.floor((Date.now() - this.tweetGenerationStatus.startTime) / 1000)
+                : 0,
+            stageElapsedTime: stageMetrics?.startTime 
+                ? Math.floor((Date.now() - stageMetrics.startTime) / 1000)
+                : 0,
+            attempts: this.tweetGenerationStatus.attempts,
+            retryCount: this.tweetGenerationStatus.retryCount,
+            consecutiveFailures: this.tweetGenerationStatus.consecutiveFailures,
+            scheduledDelay: metrics.delay,
+            stages: Object.entries(metrics.stages).map(([name, stats]) => ({
+                name,
+                duration: stats.duration ? formatDuration(stats.duration) : undefined,
+                success: stats.success,
+                attempts: stats.attempts
+            }))
+        };
+
+        if (error) {
+            elizaLogger.error('Tweet generation performance metrics:', {
+                ...logData,
+                error: {
+                    message: error.message,
+                    stack: error.stack,
+                    name: error.name
+                }
+            });
+        } else {
+            elizaLogger.log('Tweet generation performance metrics:', logData);
+        }
+    }
+
+    private async handleStageRetry(
+        stage: keyof TweetGenerationMetrics['stages'],
+        error: Error,
+        retryAction: () => Promise<void>
+    ) {
+        const stageMetrics = this.tweetGenerationStatus.metrics.stages[stage];
+        if (stageMetrics) {
+            stageMetrics.retryCount++;
+            stageMetrics.attempts++;
+            
+            if (stageMetrics.retryCount <= this.MAX_RETRY_ATTEMPTS) {
+                elizaLogger.warn(`Retrying ${stage} after error:`, {
+                    error: error.message,
+                    attempt: stageMetrics.attempts,
+                    retryCount: stageMetrics.retryCount
+                });
+                
+                await new Promise(resolve => setTimeout(resolve, this.RETRY_DELAY_MS));
+                await retryAction();
+            } else {
+                throw new Error(`Max retry attempts (${this.MAX_RETRY_ATTEMPTS}) exceeded for ${stage}`);
+            }
+        }
+    }
 
     async start(postImmediately: boolean = false) {
         if (!this.client.profile) {
@@ -82,40 +245,107 @@ export class TwitterPostClient {
                     "/lastPost"
             );
 
-            const lastPostTimestamp = lastPost?.timestamp ?? Date.now();
-            const minMinutes =
-                parseInt(this.runtime.getSetting("POST_INTERVAL_MIN")) || 90;
-            const maxMinutes =
-                parseInt(this.runtime.getSetting("POST_INTERVAL_MAX")) || 180;
-            const randomMinutes =
-                Math.floor(Math.random() * (maxMinutes - minMinutes + 1)) +
-                minMinutes;
-            const delay = randomMinutes * 60 * 1000;
-            const nextTweetTime = lastPostTimestamp + delay;
-
             const now = Date.now();
+            const lastPostTimestamp = lastPost?.timestamp ?? now;
+            const minMinutes = parseInt(this.runtime.getSetting("POST_INTERVAL_MIN")) || 90;
+            const maxMinutes = parseInt(this.runtime.getSetting("POST_INTERVAL_MAX")) || 180;
+            const randomMinutes = Math.floor(Math.random() * (maxMinutes - minMinutes + 1)) + minMinutes;
+            const delay = randomMinutes * 60 * 1000;
+
+            // Get the cached next tweet time if it exists
+            const nextTweetTimeCache = await this.runtime.cacheManager.get<{
+                timestamp: number;
+                scheduledAt: number;
+            }>("twitter/" + this.runtime.getSetting("TWITTER_USERNAME") + "/nextTweetTime");
+
+            // Debug log the timing information
+            elizaLogger.debug("Tweet timing debug:", {
+                now: new Date(now).toISOString(),
+                lastPostTimestamp: new Date(lastPostTimestamp).toISOString(),
+                nextTweetTimeCache: nextTweetTimeCache ? {
+                    timestamp: new Date(nextTweetTimeCache.timestamp).toISOString(),
+                    scheduledAt: new Date(nextTweetTimeCache.scheduledAt).toISOString()
+                } : null,
+                randomMinutes,
+                delay: formatDuration(delay)
+            });
+
+            // Use cached next tweet time or calculate from last post
+            const nextTweetTime = nextTweetTimeCache?.timestamp || (lastPostTimestamp + delay);
 
             if (now >= nextTweetTime) {
                 const executionStart = Date.now();
-                elizaLogger.log(`Tweet time reached (${Math.floor((now - nextTweetTime) / 1000)} seconds past scheduled time), generating new tweet...`);
-                await this.generateNewTweet();
-                const executionEnd = Date.now();
                 
-                // Reschedule after generating the tweet
-                const newNextTweetTime = now + delay;
-                await this.runtime.cacheManager.set(
-                    "twitter/" + this.runtime.getSetting("TWITTER_USERNAME") + "/nextTweetTime",
-                    { 
-                        timestamp: newNextTweetTime,
-                        scheduledAt: now,
-                        intervalMinutes: randomMinutes,
-                        lastExecutionDuration: executionEnd - executionStart
-                    }
-                );
-                const nextTime = new Date(newNextTweetTime);
-                elizaLogger.log(`Next tweet scheduled for ${nextTime.toLocaleTimeString()} (in ${randomMinutes} minutes)`);
+                // Calculate delay relative to cached schedule or last post
+                let delaySeconds = 0;
+                if (nextTweetTimeCache) {
+                    // If we have a cached schedule, calculate delay from that
+                    delaySeconds = Math.max(0, Math.floor((now - nextTweetTimeCache.timestamp) / 1000));
+                } else {
+                    // Otherwise calculate from last post plus minimum interval
+                    const minimumNextTime = lastPostTimestamp + (minMinutes * 60 * 1000);
+                    delaySeconds = Math.max(0, Math.floor((now - minimumNextTime) / 1000));
+                }
+
+                elizaLogger.log(`Tweet time reached (${delaySeconds} seconds past scheduled time), generating new tweet...`);
+                
+                try {
+                    await this.generateNewTweet();
+                    const executionEnd = Date.now();
+                    const executionDuration = executionEnd - executionStart;
+                    
+                    // Log performance metrics
+                    elizaLogger.log("Tweet generation performance:", {
+                        totalTime: formatDuration(executionDuration),
+                        stages: {
+                            initialization: formatDuration(this.tweetGenerationStatus.metrics.stages.initialization?.duration || 0),
+                            textGeneration: formatDuration(this.tweetGenerationStatus.metrics.stages.textGeneration?.duration || 0),
+                            imageGeneration: this.tweetGenerationStatus.metrics.stages.imageGeneration ? 
+                                formatDuration(this.tweetGenerationStatus.metrics.stages.imageGeneration.duration || 0) : 'skipped',
+                            posting: formatDuration(this.tweetGenerationStatus.metrics.stages.posting?.duration || 0)
+                        },
+                        attempts: this.tweetGenerationStatus.attempts,
+                        retryCount: this.tweetGenerationStatus.retryCount,
+                        scheduledDelay: delaySeconds > 0 ? `${formatDuration(delaySeconds * 1000)} past scheduled time` : 'on time'
+                    });
+
+                    // Schedule next tweet from NOW
+                    const newNextTweetTime = now + delay;
+                    
+                    // Debug log the new schedule
+                    elizaLogger.debug("New tweet schedule:", {
+                        executionDuration: formatDuration(executionDuration),
+                        newNextTweetTime: new Date(newNextTweetTime).toISOString(),
+                        delay: formatDuration(delay),
+                        delayFromSchedule: formatDuration(delaySeconds * 1000)
+                    });
+
+                    await this.runtime.cacheManager.set(
+                        "twitter/" + this.runtime.getSetting("TWITTER_USERNAME") + "/nextTweetTime",
+                        { 
+                            timestamp: newNextTweetTime,
+                            scheduledAt: now,
+                            intervalMinutes: randomMinutes,
+                            lastExecutionDuration: executionDuration,
+                            lastDelay: delaySeconds
+                        }
+                    );
+                    
+                    const nextTime = new Date(newNextTweetTime);
+                    elizaLogger.log(`Next tweet scheduled for ${nextTime.toLocaleTimeString()} (in ${randomMinutes} minutes)`);
+                    
+                    // Set up next check in exactly the calculated delay
+                    setTimeout(() => generateNewTweetLoop(), delay);
+                } catch (error) {
+                    // If tweet generation fails, retry sooner
+                    elizaLogger.error("Tweet generation failed, retrying in 5 minutes", error);
+                    setTimeout(() => generateNewTweetLoop(), 5 * 60 * 1000);
+                }
             } else {
-                // Only update the schedule if we're not generating a tweet
+                // Calculate exact time until next tweet
+                const timeUntilTweet = nextTweetTime - now;
+                const minutesUntilTweet = Math.ceil(timeUntilTweet / (60 * 1000));
+                
                 await this.runtime.cacheManager.set(
                     "twitter/" + this.runtime.getSetting("TWITTER_USERNAME") + "/nextTweetTime",
                     { 
@@ -124,14 +354,13 @@ export class TwitterPostClient {
                         intervalMinutes: randomMinutes
                     }
                 );
-                const minutesUntilTweet = Math.ceil((nextTweetTime - now) / (60 * 1000));
+                
                 const nextTime = new Date(nextTweetTime);
                 elizaLogger.log(`Next tweet scheduled for ${nextTime.toLocaleTimeString()} (in ${minutesUntilTweet} minutes)`);
+                
+                // Set up next check at exactly the right time
+                setTimeout(() => generateNewTweetLoop(), timeUntilTweet);
             }
-
-            setTimeout(() => {
-                generateNewTweetLoop(); // Set up next iteration
-            }, delay);
         };
 
         if (postImmediately) {
@@ -166,65 +395,82 @@ export class TwitterPostClient {
     }
 
     private async generateNewTweet() {
-        elizaLogger.log("Generating new tweet...");
-        const rawChance = this.runtime.getSetting("IMAGE_GEN_CHANCE") || "30";
-        const imageGenChancePercent = parseFloat(rawChance.replace(/[^0-9.]/g, '')) || 30;
-        elizaLogger.log(`Image generation chance set to ${imageGenChancePercent}%`);
-        
-        const shouldGenerateImage = Math.random() < (Math.max(0, Math.min(100, imageGenChancePercent)) / 100);
-        elizaLogger.log(`Will ${shouldGenerateImage ? '' : 'not '}generate image for this tweet`);
+        // Initialize metrics for new tweet generation
+        this.tweetGenerationStatus = {
+            isGenerating: true,
+            startTime: Date.now(),
+            attempts: this.tweetGenerationStatus.attempts + 1,
+            currentStage: 'initialization',
+            metrics: {
+                stages: {},
+                overallSuccess: false,
+                scheduledTime: Date.now()
+            },
+            retryCount: 0,
+            consecutiveFailures: this.tweetGenerationStatus.consecutiveFailures,
+        };
 
         try {
+            // Initialization stage
+            this.startStageMetrics('initialization');
+            elizaLogger.log(`Starting tweet generation attempt ${this.tweetGenerationStatus.attempts}`);
+            this.endStageMetrics('initialization', true);
+
+            // Text generation stage
+            this.tweetGenerationStatus.currentStage = 'text';
+            this.startStageMetrics('textGeneration');
             const content = await this.generateTweetText();
             if (!content) {
-                elizaLogger.error("Failed to generate tweet text");
-                return;
+                throw new Error('Failed to generate tweet text - no content returned');
             }
+            this.endStageMetrics('textGeneration', true);
 
-            // Check for dry run mode
-            if (this.runtime.getSetting("TWITTER_DRY_RUN") === "true") {
-                elizaLogger.info(`Dry run: would have posted tweet: ${content}`);
-                if (shouldGenerateImage) {
-                    elizaLogger.info("Dry run: would have generated an image");
-                }
-                return;
-            }
+            // Image generation decision
+            const rawChance = this.runtime.getSetting("IMAGE_GEN_CHANCE") || "30";
+            const imageGenChancePercent = parseFloat(rawChance.replace(/[^0-9.]/g, '')) || 30;
+            elizaLogger.log(`Image generation chance set to ${imageGenChancePercent}%`);
+            
+            const shouldGenerateImage = Math.random() < (Math.max(0, Math.min(100, imageGenChancePercent)) / 100);
+            elizaLogger.log(`Will ${shouldGenerateImage ? '' : 'not '}generate image for this tweet`);
 
+            let imageBuffer: Buffer | undefined;
             if (shouldGenerateImage) {
-                const imagePrompt = `Generate an image that represents this tweet: ${content}`;
-                
+                this.tweetGenerationStatus.currentStage = 'image';
+                this.startStageMetrics('imageGeneration');
                 try {
+                    const imagePrompt = `Generate an image that represents this tweet: ${content}`;
+                    
                     // Generate image using the plugin
                     const imageAction = this.runtime.plugins.find(p => p.name === "imageGeneration")?.actions?.[0];
                     if (!imageAction?.handler) {
-                        elizaLogger.error("Image generation plugin not found or handler not available");
-                        return;
+                        throw new Error('Image generation plugin not found or handler not available');
                     }
 
                     // Temporarily set modelProvider to HEURIST for image generation
                     const originalProvider = this.runtime.character.modelProvider;
+                    const originalToken = this.runtime.token;
+                    
+                    // Switch to HEURIST provider and set HEURIST API key
                     this.runtime.character.modelProvider = ModelProviderName.HEURIST;
-
-                    const imageMessage = {
-                        userId: this.runtime.agentId,
-                        roomId: stringToUuid("twitter_image_generation"),
-                        agentId: this.runtime.agentId,
-                        content: {
-                            text: imagePrompt,
-                            action: "GENERATE_IMAGE",
-                            payload: {
-                                prompt: imagePrompt,
-                                model: this.runtime.getSetting("HEURIST_IMAGE_MODEL") || "FLUX.1-dev",
-                                width: 1024,
-                                height: 1024,
-                                steps: 30
-                            }
-                        }
-                    };
+                    this.runtime.token = this.runtime.getSetting("HEURIST_API_KEY");
 
                     try {
-                        // Create state for image generation
-                        const state = await this.runtime.composeState(imageMessage, {
+                        const state = await this.runtime.composeState({
+                            userId: this.runtime.agentId,
+                            roomId: stringToUuid("twitter_image_generation"),
+                            agentId: this.runtime.agentId,
+                            content: {
+                                text: imagePrompt,
+                                action: "GENERATE_IMAGE",
+                                payload: {
+                                    prompt: imagePrompt,
+                                    model: this.runtime.getSetting("HEURIST_IMAGE_MODEL") || "FLUX.1-dev",
+                                    width: 1024,
+                                    height: 1024,
+                                    steps: 30
+                                }
+                            }
+                        }, {
                             type: "GENERATE_IMAGE",
                             payload: {
                                 prompt: imagePrompt,
@@ -235,65 +481,98 @@ export class TwitterPostClient {
                             }
                         });
 
+                        const message = {
+                            userId: this.runtime.agentId,
+                            roomId: stringToUuid("twitter_image_generation"),
+                            agentId: this.runtime.agentId,
+                            content: {
+                                text: imagePrompt,
+                                action: "GENERATE_IMAGE",
+                                payload: {
+                                    prompt: imagePrompt,
+                                    model: this.runtime.getSetting("HEURIST_IMAGE_MODEL") || "FLUX.1-dev",
+                                    width: 1024,
+                                    height: 1024,
+                                    steps: 30
+                                }
+                            }
+                        };
+
                         const result = await imageAction.handler(
                             this.runtime,
-                            imageMessage,
-                            state
-                        ) as { success: boolean; data?: string } | undefined;
-
-                        // Restore original modelProvider
+                            message,
+                            state,
+                            {}
+                        );
+                        
+                        return result;
+                    } finally {
+                        // Restore the original provider and token
                         this.runtime.character.modelProvider = originalProvider;
-
-                        if (result?.success && result.data) {
-                            // Convert file path or data URL to Buffer
-                            const imageBuffer = await this.imageToBuffer(result.data);
-                            
-                            // Send tweet with image using new API
-                            await this.client.twitterClient.sendTweetWithMedia(content, [imageBuffer]);
-                            elizaLogger.log("Posted tweet with generated image:", content);
-                        } else {
-                            // Fallback to text-only tweet if image generation fails
-                            await this.client.twitterClient.sendTweet(content);
-                            elizaLogger.log("Posted text-only tweet (image generation failed):", content);
-                        }
-                    } catch (error) {
-                        // Restore original modelProvider in case of error
-                        this.runtime.character.modelProvider = originalProvider;
-                        elizaLogger.error("Error details:", {
-                            name: error?.name,
-                            message: error?.message,
-                            stack: error?.stack,
-                            cause: error?.cause
-                        });
-                        throw error;
+                        this.runtime.token = originalToken;
                     }
                 } catch (error) {
-                    // Fallback to text-only tweet if image generation fails
-                    elizaLogger.error("Error generating image:", {
-                        name: error?.name,
-                        message: error?.message,
-                        stack: error?.stack,
-                        cause: error?.cause
-                    });
-                    await this.client.twitterClient.sendTweet(content);
-                    elizaLogger.log("Posted text-only tweet (after image error):", content);
+                    this.endStageMetrics('imageGeneration', false, error as Error);
+                    elizaLogger.warn('Continuing without image due to generation failure');
                 }
-            } else {
-                // Post text-only tweet
-                await this.client.twitterClient.sendTweet(content);
-                elizaLogger.log("Posted tweet:", content);
             }
 
-            await this.runtime.cacheManager.set(
-                "twitter/" +
-                    this.runtime.getSetting("TWITTER_USERNAME") +
-                    "/lastPost",
-                {
-                    timestamp: Date.now(),
+            // Posting stage
+            this.tweetGenerationStatus.currentStage = 'posting';
+            this.startStageMetrics('posting');
+            try {
+                if (imageBuffer) {
+                    await this.client.twitterClient.sendTweetWithMedia(content, [imageBuffer]);
+                    elizaLogger.log("Posted tweet with generated image:", content);
+                } else {
+                    await this.client.twitterClient.sendTweet(content);
+                    elizaLogger.log("Posted tweet:", content);
                 }
-            );
+                this.endStageMetrics('posting', true);
+                
+                // Update success metrics
+                this.tweetGenerationStatus.metrics.overallSuccess = true;
+                this.tweetGenerationStatus.metrics.actualPostTime = Date.now();
+                this.tweetGenerationStatus.metrics.delay = 
+                    this.tweetGenerationStatus.metrics.actualPostTime - 
+                    (this.tweetGenerationStatus.metrics.scheduledTime || 0);
+                
+                this.tweetGenerationStatus.consecutiveFailures = 0;
+                this.tweetGenerationStatus.lastSuccessfulPost = Date.now();
+
+                // Log final success metrics
+                this.logPerformanceMetrics('Tweet generation completed successfully');
+                
+            } catch (error) {
+                this.endStageMetrics('posting', false, error as Error);
+                throw error;
+            }
+
         } catch (error) {
-            elizaLogger.error("Error generating/posting tweet:", error);
+            // Update failure metrics
+            this.tweetGenerationStatus.consecutiveFailures++;
+            this.tweetGenerationStatus.lastError = error?.message;
+            
+            // Log comprehensive failure metrics
+            this.logPerformanceMetrics(
+                `Failed during ${this.tweetGenerationStatus.currentStage} stage`,
+                false,
+                error as Error
+            );
+
+            // Attempt retry if applicable
+            if (this.tweetGenerationStatus.retryCount < this.MAX_RETRY_ATTEMPTS) {
+                this.tweetGenerationStatus.retryCount++;
+                elizaLogger.warn(`Scheduling retry attempt ${this.tweetGenerationStatus.retryCount}/${this.MAX_RETRY_ATTEMPTS}`);
+                setTimeout(() => this.generateNewTweet(), this.RETRY_DELAY_MS);
+            } else {
+                elizaLogger.error('Max retry attempts exceeded, giving up on this tweet generation');
+                throw error;
+            }
+        } finally {
+            if (this.tweetGenerationStatus.retryCount >= this.MAX_RETRY_ATTEMPTS) {
+                this.tweetGenerationStatus.isGenerating = false;
+            }
         }
     }
 
@@ -325,7 +604,11 @@ export class TwitterPostClient {
     }
 
     private async generateTweetText(): Promise<string | undefined> {
+        const startTime = Date.now();
+        let stage = 'initialization';
         try {
+            elizaLogger.log('Ensuring user exists...');
+            stage = 'user_verification';
             await this.runtime.ensureUserExists(
                 this.runtime.agentId,
                 this.client.profile.username,
@@ -333,16 +616,25 @@ export class TwitterPostClient {
                 "twitter"
             );
 
+            elizaLogger.log('Fetching timeline data...');
+            stage = 'timeline_fetch';
             let homeTimeline: Tweet[] = [];
+            let timelineSource = 'cache';
 
             const cachedTimeline = await this.client.getCachedTimeline();
 
             if (cachedTimeline) {
+                elizaLogger.log('Using cached timeline data');
                 homeTimeline = cachedTimeline;
             } else {
+                elizaLogger.log('Fetching fresh timeline data');
+                timelineSource = 'api';
                 homeTimeline = await this.client.fetchHomeTimeline(10);
                 await this.client.cacheTimeline(homeTimeline);
             }
+
+            elizaLogger.log('Preparing tweet generation context...');
+            stage = 'context_preparation';
             const formattedHomeTimeline =
                 `# ${this.runtime.character.name}'s Home Timeline\n\n` +
                 homeTimeline
@@ -352,7 +644,9 @@ export class TwitterPostClient {
                     .join("\n");
 
             const topics = this.runtime.character.topics.join(", ");
-
+            
+            elizaLogger.log('Composing tweet generation state...');
+            stage = 'state_composition';
             const state = await this.runtime.composeState(
                 {
                     userId: this.runtime.agentId,
@@ -376,24 +670,51 @@ export class TwitterPostClient {
                     twitterPostTemplate,
             });
 
-            elizaLogger.debug("generate post prompt:\n" + context);
-
+            elizaLogger.log('Generating tweet text with AI model...');
+            stage = 'ai_generation';
+            const generationStart = Date.now();
             const newTweetContent = await generateText({
                 runtime: this.runtime,
                 context,
                 modelClass: ModelClass.SMALL,
             });
 
+            const generationDuration = Math.floor((Date.now() - generationStart) / 1000);
+            elizaLogger.log(`AI model response received in ${generationDuration}s`);
+
+            if (!newTweetContent) {
+                throw new Error('AI model returned empty tweet content');
+            }
+
             // Replace \n with proper line breaks and trim excess spaces
+            stage = 'text_formatting';
             const formattedTweet = newTweetContent
                 .replaceAll(/\\n/g, "\n")
                 .trim();
 
+            const duration = Math.floor((Date.now() - startTime) / 1000);
+            elizaLogger.log(`Successfully generated tweet text in ${duration}s`, {
+                timelineSource,
+                generationTime: generationDuration,
+                totalTime: duration,
+                textLength: formattedTweet.length
+            });
+            
             // Use the helper function to truncate to complete sentence
             return truncateToCompleteSentence(formattedTweet);
 
         } catch (error) {
-            elizaLogger.error("Error generating tweet text:", error);
+            const duration = Math.floor((Date.now() - startTime) / 1000);
+            elizaLogger.error('Error generating tweet text:', {
+                error: error?.message,
+                stack: error?.stack,
+                stage,
+                duration: `${duration}s`,
+                failurePoint: stage,
+                attempts: this.tweetGenerationStatus.attempts,
+                retryCount: this.tweetGenerationStatus.retryCount,
+                consecutiveFailures: this.tweetGenerationStatus.consecutiveFailures
+            });
             return undefined;
         }
     }
